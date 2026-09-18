@@ -1,3 +1,25 @@
+## Architecture decisions
+
+### Why SSM Parameter Store and not remote state here
+
+The VPC id and the nine subnet ids are written to `/<project>/vpc/*` in Parameter Store (`parameters_store.tf`); `output.tf` re-exports those parameter resources and marks every one `sensitive`. I rejected `terraform_remote_state`: each stack holds its own state file (`environment/dev/backend.tfvars.example`, `key = "vpc/dev/state"`), so a consumer reading it would need `s3:GetObject` on the whole file — every attribute of every resource — just to learn ten ids, and would break the day I move the bucket or the key. A path prefix is the smaller grant and the stabler contract.
+
+### Why the database tier has no route table at all
+
+`database_subnets.tf` creates three subnets and zero `aws_route_table_association` — the omission *is* the control. They stay on the VPC main route table, which carries only the local `10.0.0.0/16` route: no IGW, no NAT, in or out. Attaching them to the per-AZ private tables, as most three-tier layouts do, would hand the database egress it never needs — a compromised engine can dial out, and every byte bills as NAT processing. The cost I accept: nothing in these subnets reaches an AWS API without an endpoint, and this repo creates none.
+
+### Why three NAT gateways and not one
+
+`nat_gateway.tf` builds an EIP and a NAT gateway in each public subnet, and `private_subnets.tf` gives every AZ its own route table sending `0.0.0.0/0` to the NAT in that AZ. A single shared NAT in 1a would cut the fixed bill to a third, and I turned that down: every byte leaving 1b and 1c would cross an AZ boundary and be billed twice (transfer plus NAT processing), and losing 1a would take egress away from two healthy AZs — which defeats the point of spreading across three.
+
+### Why hard-coded AZ letters and not `aws_availability_zones`
+
+Subnets pin their AZ with `format("%sa", var.region)` instead of indexing a data source. An index into that list is not guaranteed to land on the same physical AZ in another account, and `availability_zone` forces replacement — Terraform destroys and recreates the subnet and everything in it. Pinning also keeps `/<project>/vpc/subnet_private_1a` meaning the same AZ for the life of the account, which is what makes the SSM contract worth publishing. The price: this module only runs in regions exposing a/b/c, and `variables.tf` takes nothing but `project_name` and `region`, neither with a default.
+
+### Why /20 private and /24 public/database
+
+Private subnets get `10.0.0.0/20`, `10.0.16.0/20` and `10.0.32.0/20` — 4,091 usable each — while public and database are /24s packed above them at `.48` through `.53`. Uniform /24s would read tidier and cap the private tier at 251 addresses per AZ; one ENI takes one address, so that ceiling shows up as a placement failure mid scale-up, not as a warning. Packing the /24s at the top leaves `10.0.54.0` upward contiguous for a new tier without renumbering anything.
+
 ![Architecture](/arch.jpg)
 ![Architecture](/arch2.jpg)
 
