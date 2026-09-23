@@ -1,24 +1,44 @@
+# aws-vpc
+
+A three-tier VPC for container workloads. It has public, private and database subnets in three availability zones, and one NAT gateway per zone. The VPC and subnet IDs are saved in SSM Parameter Store so other stacks can read them.
+
 ## Architecture decisions
 
-### Why SSM Parameter Store and not remote state here
+### SSM Parameter Store instead of remote state
 
-The VPC id and the nine subnet ids are written to `/<project>/vpc/*` in Parameter Store (`parameters_store.tf`); `output.tf` re-exports those parameter resources and marks every one `sensitive`. I rejected `terraform_remote_state`: each stack holds its own state file (`environment/dev/backend.tfvars.example`, `key = "vpc/dev/state"`), so a consumer reading it would need `s3:GetObject` on the whole file — every attribute of every resource — just to learn ten ids, and would break the day I move the bucket or the key. A path prefix is the smaller grant and the stabler contract.
+`parameters_store.tf` writes the VPC ID and the nine subnet IDs to Parameter Store under `/<project>/vpc/`. `output.tf` exposes the same values and marks them `sensitive`.
 
-### Why the database tier has no route table at all
+The alternative is `terraform_remote_state`. With that, every stack that needs a subnet ID must be able to read this stack's whole state file, not just the IDs. It also ties those stacks to the bucket and key where the state lives. With Parameter Store, other stacks only need read access to the `/<project>/vpc/` parameters.
 
-`database_subnets.tf` creates three subnets and zero `aws_route_table_association` — the omission *is* the control. They stay on the VPC main route table, which carries only the local `10.0.0.0/16` route: no IGW, no NAT, in or out. Attaching them to the per-AZ private tables, as most three-tier layouts do, would hand the database egress it never needs — a compromised engine can dial out, and every byte bills as NAT processing. The cost I accept: nothing in these subnets reaches an AWS API without an endpoint, and this repo creates none.
+### The database subnets have no route to the internet
 
-### Why three NAT gateways and not one
+`database_subnets.tf` creates three subnets and does not associate them with any route table. They use the VPC's main route table, which only has the local `10.0.0.0/16` route. There is no internet gateway or NAT route, so nothing in these subnets can reach the internet and the internet cannot reach them.
 
-`nat_gateway.tf` builds an EIP and a NAT gateway in each public subnet, and `private_subnets.tf` gives every AZ its own route table sending `0.0.0.0/0` to the NAT in that AZ. A single shared NAT in 1a would cut the fixed bill to a third, and I turned that down: every byte leaving 1b and 1c would cross an AZ boundary and be billed twice (transfer plus NAT processing), and losing 1a would take egress away from two healthy AZs — which defeats the point of spreading across three.
+The limitation: these subnets also cannot reach AWS APIs such as S3 or DynamoDB unless VPC endpoints are added. This repo does not create any.
 
-### Why hard-coded AZ letters and not `aws_availability_zones`
+### Three NAT gateways, one per AZ
 
-Subnets pin their AZ with `format("%sa", var.region)` instead of indexing a data source. An index into that list is not guaranteed to land on the same physical AZ in another account, and `availability_zone` forces replacement — Terraform destroys and recreates the subnet and everything in it. Pinning also keeps `/<project>/vpc/subnet_private_1a` meaning the same AZ for the life of the account, which is what makes the SSM contract worth publishing. The price: this module only runs in regions exposing a/b/c, and `variables.tf` takes nothing but `project_name` and `region`, neither with a default.
+`nat_gateway.tf` creates an Elastic IP and a NAT gateway in each public subnet. `private_subnets.tf` gives each AZ its own route table, which sends `0.0.0.0/0` to the NAT in the same AZ.
 
-### Why /20 private and /24 public/database
+A single NAT gateway costs less: one hourly charge instead of three. But if the AZ with that NAT fails, private subnets in the other two AZs lose internet access too. One NAT per AZ keeps each AZ independent. It also avoids paying for traffic that crosses AZs to reach a NAT.
 
-Private subnets get `10.0.0.0/20`, `10.0.16.0/20` and `10.0.32.0/20` — 4,091 usable each — while public and database are /24s packed above them at `.48` through `.53`. Uniform /24s would read tidier and cap the private tier at 251 addresses per AZ; one ENI takes one address, so that ceiling shows up as a placement failure mid scale-up, not as a warning. Packing the /24s at the top leaves `10.0.54.0` upward contiguous for a new tier without renumbering anything.
+The downside: outbound traffic leaves from three public IPs instead of one. If a partner allowlists your IPs on their firewall, they need all three.
+
+### AZs are hardcoded letters
+
+Subnets set their AZ with `format("%sa", var.region)`, `%sb` and `%sc`. This is a shortcut: it is the simplest way to put three subnets in three AZs. It has limits:
+
+- It only works in regions that have AZs `a`, `b` and `c`.
+- AZ names point to different physical zones in different AWS accounts. Only AZ IDs, such as `use1-az1`, are the same everywhere.
+- Changing `availability_zone` on a subnet makes Terraform destroy and recreate it, along with everything inside it.
+
+A more flexible approach is to take a list of AZs from a variable or from `aws_availability_zones` and create the subnets with `for_each`. This repo does not do that.
+
+### /20 private subnets, /24 public and database subnets
+
+The private subnets are `10.0.0.0/20`, `10.0.16.0/20` and `10.0.32.0/20`, with 4,091 usable addresses each. The public and database subnets are /24s, from `10.0.48.0` to `10.0.53.0`, with 251 usable addresses each.
+
+The private subnets hold the container workloads, and every task or pod with its own network interface uses one IP address. A /24 would run out of addresses as those workloads scale. The public and database subnets hold fewer resources, so /24 is enough. The range from `10.0.54.0` up is still free for another tier later.
 
 ![Architecture](/arch.jpg)
 ![Architecture](/arch2.jpg)
@@ -83,20 +103,20 @@ No modules.
 
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
-| <a name="input_project_name"></a> [project\_name](#input\_project\_name) | Project name. This variable will be a prefix for resources created within this project | `any` | n/a | yes |
-| <a name="input_region"></a> [region](#input\_region) | AWS region where resources will be created | `string` | `"us-east-1"` | no |
+| <a name="input_project_name"></a> [project\_name](#input\_project\_name) | Project name, used as a prefix for resource names. | `any` | n/a | yes |
+| <a name="input_region"></a> [region](#input\_region) | AWS region where resources will be created. | `any` | n/a | yes |
 
 ## Outputs
 
 | Name | Description |
 |------|-------------|
-| <a name="output_ssm_subnet_databases_1a"></a> [ssm\_subnet\_databases\_1a](#output\_ssm\_subnet\_databases\_1a) | Database subnet ID in availability zone 1a. This ID is retrieved from AWS Systems Manager Parameter Store and used for provisioning database instances in this specific zone. |
-| <a name="output_ssm_subnet_databases_1b"></a> [ssm\_subnet\_databases\_1b](#output\_ssm\_subnet\_databases\_1b) | Database subnet ID in availability zone 1b. Obtained from AWS Systems Manager Parameter Store, it is essential for allocating database instances that need to be isolated in this zone. |
-| <a name="output_ssm_subnet_databases_1c"></a> [ssm\_subnet\_databases\_1c](#output\_ssm\_subnet\_databases\_1c) | Database subnet ID in availability zone 1c, sourced from AWS Systems Manager Parameter Store. Used for provisioning database instances that require isolation in this zone. |
-| <a name="output_ssm_subnet_private_1a"></a> [ssm\_subnet\_private\_1a](#output\_ssm\_subnet\_private\_1a) | Private subnet ID in availability zone 1a. Value stored in AWS Systems Manager Parameter Store, used to provision resources in a specific private subnet. |
-| <a name="output_ssm_subnet_private_1b"></a> [ssm\_subnet\_private\_1b](#output\_ssm\_subnet\_private\_1b) | Private subnet ID in availability zone 1b. Stored in AWS Systems Manager Parameter Store, used for allocating resources that require isolation within this availability zone. |
-| <a name="output_ssm_subnet_private_1c"></a> [ssm\_subnet\_private\_1c](#output\_ssm\_subnet\_private\_1c) | Private subnet ID in availability zone 1c. Stored in AWS Systems Manager Parameter Store, it is crucial for creating resources that need to be isolated in this specific zone. |
-| <a name="output_ssm_subnet_public_1a"></a> [ssm\_subnet\_public\_1a](#output\_ssm\_subnet\_public\_1a) | Public subnet ID in availability zone 1a. This ID, sourced from AWS Systems Manager Parameter Store, is used to provision publicly accessible resources in this zone. |
-| <a name="output_ssm_subnet_public_1b"></a> [ssm\_subnet\_public\_1b](#output\_ssm\_subnet\_public\_1b) | Public subnet ID in availability zone 1b. Available via AWS Systems Manager Parameter Store, enables the deployment of resources with public access in this specific zone. |
-| <a name="output_ssm_subnet_public_1c"></a> [ssm\_subnet\_public\_1c](#output\_ssm\_subnet\_public\_1c) | Public subnet ID in availability zone 1c, stored in AWS Systems Manager Parameter Store. Used to configure resources that need public access in this zone. |
-| <a name="output_ssm_vpc_id"></a> [ssm\_vpc\_id](#output\_ssm\_vpc\_id) | VPC ID stored in AWS Systems Manager Parameter Store. This ID is used to identify the VPC where resources will be provisioned. |
+| <a name="output_ssm_subnet_databases_1a"></a> [ssm\_subnet\_databases\_1a](#output\_ssm\_subnet\_databases\_1a) | Database subnet ID in AZ 1a, stored in Parameter Store. |
+| <a name="output_ssm_subnet_databases_1b"></a> [ssm\_subnet\_databases\_1b](#output\_ssm\_subnet\_databases\_1b) | Database subnet ID in AZ 1b, stored in Parameter Store. |
+| <a name="output_ssm_subnet_databases_1c"></a> [ssm\_subnet\_databases\_1c](#output\_ssm\_subnet\_databases\_1c) | Database subnet ID in AZ 1c, stored in Parameter Store. |
+| <a name="output_ssm_subnet_private_1a"></a> [ssm\_subnet\_private\_1a](#output\_ssm\_subnet\_private\_1a) | Private subnet ID in AZ 1a, stored in Parameter Store. |
+| <a name="output_ssm_subnet_private_1b"></a> [ssm\_subnet\_private\_1b](#output\_ssm\_subnet\_private\_1b) | Private subnet ID in AZ 1b, stored in Parameter Store. |
+| <a name="output_ssm_subnet_private_1c"></a> [ssm\_subnet\_private\_1c](#output\_ssm\_subnet\_private\_1c) | Private subnet ID in AZ 1c, stored in Parameter Store. |
+| <a name="output_ssm_subnet_public_1a"></a> [ssm\_subnet\_public\_1a](#output\_ssm\_subnet\_public\_1a) | Public subnet ID in AZ 1a, stored in Parameter Store. |
+| <a name="output_ssm_subnet_public_1b"></a> [ssm\_subnet\_public\_1b](#output\_ssm\_subnet\_public\_1b) | Public subnet ID in AZ 1b, stored in Parameter Store. |
+| <a name="output_ssm_subnet_public_1c"></a> [ssm\_subnet\_public\_1c](#output\_ssm\_subnet\_public\_1c) | Public subnet ID in AZ 1c, stored in Parameter Store. |
+| <a name="output_ssm_vpc_id"></a> [ssm\_vpc\_id](#output\_ssm\_vpc\_id) | VPC ID, stored in Parameter Store. |
